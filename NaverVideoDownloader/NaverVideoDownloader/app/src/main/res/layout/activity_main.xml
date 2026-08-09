@@ -1,82 +1,309 @@
-<?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:padding="8dp">
+package com.rus.videodownloader
 
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal">
+import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.os.Bundle
+import android.os.Environment
+import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import com.rus.videodownloader.databinding.ActivityMainBinding
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.TimeUnit
 
-        <EditText
-            android:id="@+id/urlInput"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:hint="기사 URL 입력"
-            android:inputType="textUri"
-            android:autofillHints="" />
+class MainActivity : AppCompatActivity() {
 
-        <Button
-            android:id="@+id/loadButton"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="불러오기" />
-    </LinearLayout>
+    private lateinit var binding: ActivityMainBinding
+    private val scope = CoroutineScope(Dispatchers.Main)
 
-    <WebView
-        android:id="@+id/webView"
-        android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:layout_marginTop="8dp" />
+    // m3u8/mp4로 명확히 식별된 항목 (URL 그대로 저장, 발견 순서 유지)
+    private val detectedPlaylists = LinkedHashSet<String>()
 
-    <TextView
-        android:id="@+id/statusText"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="상태: 대기 중"
-        android:textSize="12sp" />
+    // m3u8 재생목록이 감지되지 않는 사이트를 대비해, 개별 .ts 세그먼트를 직접 수집한다.
+    // key: 세그먼트가 속한 폴더 경로(그룹), value: (순번 -> URL)
+    private val segmentGroups = LinkedHashMap<String, MutableMap<Int, String>>()
 
-    <ScrollView
-        android:layout_width="match_parent"
-        android:layout_height="80dp"
-        android:layout_marginTop="4dp"
-        android:background="#EEEEEE">
+    private var currentArticleUrl: String = ""
 
-        <TextView
-            android:id="@+id/logText"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:padding="4dp"
-            android:textSize="10sp"
-            android:textIsSelectable="true" />
-    </ScrollView>
+    private val httpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .build()
+    }
 
-    <Button
-        android:id="@+id/copyLogButton"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="로그 복사" />
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
 
-    <ProgressBar
-        android:id="@+id/progressBar"
-        style="?android:attr/progressBarStyleHorizontal"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:max="100" />
+        binding.webView.settings.javaScriptEnabled = true
+        binding.webView.settings.domStorageEnabled = true
+        binding.webView.settings.mediaPlaybackRequiresUserGesture = false
 
-    <Button
-        android:id="@+id/downloadButton"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="최고화질 다운로드"
-        android:enabled="false" />
+        binding.webView.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(
+                view: WebView,
+                request: WebResourceRequest
+            ): WebResourceResponse? {
+                val url = request.url.toString()
+                val lower = url.lowercase()
+                val pathOnly = lower.substringBefore("?")
 
-</LinearLayout>
+                when {
+                    // 1) 재생목록 파일 자체가 잡히는 경우 (가장 이상적인 경우)
+                    pathOnly.endsWith(".m3u8") -> {
+                        runOnUiThread { onPlaylistDetected(url) }
+                    }
+                    // 2) 단일 mp4 직접 링크
+                    pathOnly.endsWith(".mp4") -> {
+                        runOnUiThread { onPlaylistDetected(url) }
+                    }
+                    // 3) 재생목록 없이 개별 .ts 세그먼트만 보이는 경우 (네이버TV 인라인 영상 등)
+                    pathOnly.endsWith(".ts") -> {
+                        runOnUiThread { onSegmentDetected(url) }
+                    }
+                }
+
+                return super.shouldInterceptRequest(view, request)
+            }
+        }
+
+        binding.loadButton.setOnClickListener {
+            val url = binding.urlInput.text.toString().trim()
+            if (url.isEmpty()) {
+                Toast.makeText(this, "URL을 입력하세요", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            startLoad(url)
+        }
+
+        binding.downloadButton.setOnClickListener {
+            downloadBest()
+        }
+
+        binding.copyLogButton.setOnClickListener {
+            copyLogToClipboard()
+        }
+    }
+
+    private fun copyLogToClipboard() {
+        val logContent = binding.logText.text.toString()
+        if (logContent.isBlank()) {
+            Toast.makeText(this, "복사할 로그가 없습니다", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("영상 다운로더 로그", logContent))
+        Toast.makeText(this, "로그를 클립보드에 복사했습니다", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun startLoad(url: String) {
+        currentArticleUrl = url
+        detectedPlaylists.clear()
+        segmentGroups.clear()
+        binding.logText.text = ""
+        binding.statusText.text = "상태: 페이지 로딩 중..."
+        binding.downloadButton.isEnabled = false
+        binding.webView.loadUrl(url)
+    }
+
+    private fun onPlaylistDetected(url: String) {
+        if (detectedPlaylists.add(url)) {
+            appendLog("재생목록/영상 URL 감지: $url")
+            binding.statusText.text = "상태: 스트림 ${detectedPlaylists.size}개 감지됨 (다운로드 가능)"
+            binding.downloadButton.isEnabled = true
+        }
+    }
+
+    /**
+     * m3u8 없이 개별 .ts 세그먼트만 보이는 경우, 같은 폴더에 속한 세그먼트끼리 그룹으로 묶고
+     * 파일명 끝의 숫자(순번)를 추출해 정렬 기준으로 사용한다.
+     * 예: .../hls/f94f8130-...-000005.ts -> 그룹 ".../hls", 순번 5
+     */
+    private fun onSegmentDetected(url: String) {
+        val pathOnly = url.substringBefore("?")
+        val groupKey = pathOnly.substringBeforeLast("/")
+
+        val seqMatch = Regex("-(\\d+)\\.ts$").find(pathOnly)
+            ?: Regex("(\\d+)\\.ts$").find(pathOnly)
+        val seq = seqMatch?.groupValues?.get(1)?.toIntOrNull()
+
+        if (seq == null) {
+            appendLog("세그먼트 감지(순번 인식 실패): $url")
+            return
+        }
+
+        val map = segmentGroups.getOrPut(groupKey) { mutableMapOf() }
+        if (!map.containsKey(seq)) {
+            map[seq] = url
+            appendLog("세그먼트 #$seq 감지 (그룹 누적 ${map.size}개)")
+            binding.statusText.text = "상태: 세그먼트 ${map.size}개 수집됨 (다운로드 가능)"
+            binding.downloadButton.isEnabled = true
+        }
+    }
+
+    private fun appendLog(line: String) {
+        binding.logText.append("$line\n")
+    }
+
+    private fun downloadBest() {
+        if (detectedPlaylists.isEmpty() && segmentGroups.isEmpty()) {
+            Toast.makeText(this, "감지된 스트림이 없습니다", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        binding.downloadButton.isEnabled = false
+        binding.statusText.text = "상태: 분석 중..."
+
+        val cookie = CookieManager.getInstance().getCookie(currentArticleUrl)
+        val userAgent = binding.webView.settings.userAgentString
+        val downloader = SegmentDownloader(httpClient, currentArticleUrl, userAgent, cookie)
+
+        scope.launch {
+            try {
+                // 감지된 항목 중 가장 나중에 발견된 것부터 확인 (보통 실제 재생에 쓰인 것이 마지막)
+                val candidates = detectedPlaylists.toList().reversed()
+
+                // 1) MP4 직접 링크가 있으면 그것부터 우선 시도 (세그먼트 병합 불필요, 가장 단순)
+                val mp4Url = candidates.firstOrNull { it.lowercase().contains(".mp4") }
+                if (mp4Url != null) {
+                    downloadSingleMp4(downloader, mp4Url)
+                    return@launch
+                }
+
+                // 2) m3u8(HLS) 재생목록이 감지된 경우 정석대로 처리
+                val m3u8Result = tryDownloadFromMasterOrMediaPlaylist(downloader, candidates)
+                if (m3u8Result) {
+                    return@launch
+                }
+
+                // 3) m3u8도 mp4도 없다면, 직접 수집된 .ts 세그먼트 그룹을 사용한다.
+                if (segmentGroups.isNotEmpty()) {
+                    downloadFromRawSegments(downloader)
+                    return@launch
+                }
+
+                binding.statusText.text = "상태: 재생 가능한 영상을 찾지 못함"
+                binding.downloadButton.isEnabled = true
+            } catch (e: Exception) {
+                binding.statusText.text = "상태: 오류 - ${e.message}"
+                appendLog("오류: ${e.message}")
+                binding.downloadButton.isEnabled = true
+            }
+        }
+    }
+
+    private suspend fun downloadSingleMp4(downloader: SegmentDownloader, mp4Url: String) {
+        appendLog("MP4 직접 다운로드: $mp4Url")
+        binding.statusText.text = "상태: MP4 다운로드 중..."
+        val fileName = "video_${timestamp()}.mp4"
+        val outputFile = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), fileName)
+
+        downloader.downloadAndMerge(listOf(mp4Url), outputFile) { _, _ ->
+            runOnUiThread { binding.statusText.text = "상태: MP4 다운로드 중" }
+        }
+
+        finishDownload(outputFile)
+    }
+
+    /** m3u8 마스터/미디어 재생목록을 파싱해 최고화질로 다운로드. 성공 시 true, 대상이 없으면 false. */
+    private suspend fun tryDownloadFromMasterOrMediaPlaylist(
+        downloader: SegmentDownloader,
+        candidates: List<String>
+    ): Boolean {
+        var mediaPlaylistUrl: String? = null
+        var mediaPlaylistContent: String? = null
+
+        for (candidateUrl in candidates) {
+            val content = downloader.fetchText(candidateUrl) ?: continue
+
+            if (M3u8Parser.isMasterPlaylist(content)) {
+                val variants = M3u8Parser.parseVariants(content, candidateUrl)
+                val best = M3u8Parser.pickHighestQuality(variants)
+                if (best != null) {
+                    appendLog("최고화질 선택: ${best.width}x${best.height} (${best.bandwidth} bps)")
+                    val variantContent = downloader.fetchText(best.url)
+                    if (variantContent != null && M3u8Parser.isMediaPlaylist(variantContent)) {
+                        mediaPlaylistUrl = best.url
+                        mediaPlaylistContent = variantContent
+                        break
+                    }
+                }
+            } else if (M3u8Parser.isMediaPlaylist(content)) {
+                mediaPlaylistUrl = candidateUrl
+                mediaPlaylistContent = content
+                break
+            }
+        }
+
+        if (mediaPlaylistUrl == null || mediaPlaylistContent == null) {
+            return false
+        }
+
+        val segments = M3u8Parser.parseSegments(mediaPlaylistContent, mediaPlaylistUrl)
+        downloadSegmentList(downloader, segments)
+        return true
+    }
+
+    /** m3u8 없이 수집된 .ts 그룹 중 세그먼트 수가 가장 많은 그룹을 골라 순번대로 다운로드한다. */
+    private suspend fun downloadFromRawSegments(downloader: SegmentDownloader) {
+        val bestGroup = segmentGroups.maxByOrNull { it.value.size }?.value
+        if (bestGroup == null) {
+            binding.statusText.text = "상태: 세그먼트 그룹을 찾지 못함"
+            binding.downloadButton.isEnabled = true
+            return
+        }
+        val orderedUrls = bestGroup.toSortedMap().values.toList()
+        appendLog("재생목록(m3u8) 없이 세그먼트 ${orderedUrls.size}개로 병합 시도")
+        downloadSegmentList(downloader, orderedUrls)
+    }
+
+    private suspend fun downloadSegmentList(downloader: SegmentDownloader, segments: List<String>) {
+        if (segments.isEmpty()) {
+            binding.statusText.text = "상태: 다운로드할 세그먼트가 없음"
+            binding.downloadButton.isEnabled = true
+            return
+        }
+
+        appendLog("세그먼트 ${segments.size}개 다운로드 시작")
+        binding.statusText.text = "상태: 다운로드 중 (0/${segments.size})"
+        binding.progressBar.max = segments.size
+        binding.progressBar.progress = 0
+
+        val fileName = "video_${timestamp()}.ts"
+        val outputFile = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), fileName)
+
+        downloader.downloadAndMerge(segments, outputFile) { done, total ->
+            runOnUiThread {
+                binding.progressBar.progress = done
+                binding.statusText.text = "상태: 다운로드 중 ($done/$total)"
+            }
+        }
+
+        finishDownload(outputFile)
+    }
+
+    private fun finishDownload(outputFile: File) {
+        binding.statusText.text = "상태: 완료 -> ${outputFile.absolutePath}"
+        appendLog("저장 완료: ${outputFile.absolutePath}")
+        Toast.makeText(this@MainActivity, "다운로드 완료", Toast.LENGTH_LONG).show()
+        binding.downloadButton.isEnabled = true
+    }
+
+    private fun timestamp(): String =
+        SimpleDateFormat("yyyyMMdd_HHmmss", Locale.KOREA).format(Date())
+}
