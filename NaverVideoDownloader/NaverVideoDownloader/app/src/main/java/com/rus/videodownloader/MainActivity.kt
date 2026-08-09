@@ -19,6 +19,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.rus.videodownloader.databinding.ActivityMainBinding
@@ -26,6 +27,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
+import org.json.JSONArray
 import org.json.JSONTokener
 import java.io.File
 import java.text.SimpleDateFormat
@@ -76,15 +78,21 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun onVideoEnded() {
             runOnUiThread {
-                triggerAutoDownloadOnce("자동 배속 재생 완료 감지")
+                triggerAutoDownloadOnce("재생 완료 감지")
             }
         }
 
         @JavascriptInterface
         fun onVideoFound() {
             runOnUiThread {
-                appendLog("영상 요소 발견, 배속 자동 재생 시작")
+                appendLog("영상 요소 발견. 재생 버튼을 누르면 화질 선택 팝업이 뜹니다.")
             }
+        }
+
+        /** 사용자가 재생을 누른 직후, 페이지에서 수집한 화질 옵션 목록(JSON 문자열 배열)을 전달받는다. */
+        @JavascriptInterface
+        fun onQualityOptionsFound(optionsJson: String) {
+            runOnUiThread { showQualityPickerDialog(optionsJson) }
         }
     }
 
@@ -134,7 +142,7 @@ class MainActivity : AppCompatActivity() {
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
                 extractArticleMeta(view)
-                view.evaluateJavascript(AUTO_PLAY_SCRIPT, null)
+                view.evaluateJavascript(SETUP_SCRIPT, null)
             }
         }
 
@@ -165,6 +173,57 @@ class MainActivity : AppCompatActivity() {
         if (!granted) {
             storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
         }
+    }
+
+    /** 화질 옵션 팝업을 표시한다. 옵션이 없으면 기본 화질로 그냥 재생을 재개한다. */
+    private fun showQualityPickerDialog(optionsJson: String) {
+        val options = try {
+            val arr = JSONArray(optionsJson)
+            (0 until arr.length()).map { arr.getString(it) }
+        } catch (e: Exception) {
+            emptyList()
+        }
+
+        if (options.isEmpty()) {
+            appendLog("화질 옵션을 찾지 못함, 기본 화질로 재생합니다.")
+            resumeDefaultPlayback()
+            return
+        }
+
+        val sorted = options.distinct().sortedByDescending { extractLeadingNumber(it) ?: -1 }
+        appendLog("화질 옵션 감지: ${sorted.joinToString(", ")}")
+
+        AlertDialog.Builder(this)
+            .setTitle("다운로드할 화질을 선택하세요")
+            .setItems(sorted.toTypedArray()) { _, which ->
+                selectQualityAndPlay(sorted[which])
+            }
+            .setCancelable(false)
+            .show()
+    }
+
+    private fun extractLeadingNumber(text: String): Int? =
+        Regex("(\\d{3,4})").find(text)?.groupValues?.get(1)?.toIntOrNull()
+
+    /** 사용자가 고른 화질 옵션을 웹뷰에서 클릭시키고, 그 화질로만 재생을 시작한다. */
+    private fun selectQualityAndPlay(qualityText: String) {
+        appendLog("선택한 화질: $qualityText -> 해당 화질로 재생 시작")
+
+        // 선택 이전에 수집된(기본 화질) 데이터는 버리고, 선택한 화질부터 새로 수집한다.
+        segmentGroups.clear()
+        detectedPlaylists.clear()
+        autoDownloadTriggered = false
+
+        val escaped = qualityText.replace("\\", "\\\\").replace("'", "\\'")
+        val clickScript = "window.__naverDlSelectQuality && window.__naverDlSelectQuality('$escaped');"
+        binding.webView.evaluateJavascript(clickScript) {
+            binding.webView.evaluateJavascript(RESUME_PLAYBACK_SCRIPT, null)
+        }
+        binding.statusText.text = "상태: ${qualityText} 화질로 재생 중 (수집 대기)"
+    }
+
+    private fun resumeDefaultPlayback() {
+        binding.webView.evaluateJavascript(RESUME_PLAYBACK_SCRIPT, null)
     }
 
     /** og:title / 발행일 메타 태그를 읽어 기사 제목과 날짜를 가져온다. */
@@ -300,7 +359,7 @@ class MainActivity : AppCompatActivity() {
         val map = segmentGroups.getOrPut(groupKey) { mutableMapOf() }
         if (!map.containsKey(seq)) {
             map[seq] = url
-            appendLog("세그먼트 #$seq 감지 (그룹 누적 ${map.size}개)")
+            appendLog("세그먼트 #$seq 감지 (누적 ${map.size}개)")
             binding.statusText.text = "상태: 세그먼트 ${map.size}개 수집 중 (재생 종료 시 자동 다운로드)"
             binding.downloadButton.isEnabled = true
             // 세그먼트는 전체 개수를 알 수 없으므로 여기서는 자동 다운로드하지 않고
@@ -352,6 +411,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 // 3) m3u8도 mp4도 없다면, 직접 수집된 .ts 세그먼트 그룹을 사용한다.
+                //    (사용자가 화질을 선택한 이후 데이터만 남아있으므로 보통 그룹이 하나뿐이다.)
                 if (segmentGroups.isNotEmpty()) {
                     downloadFromRawSegments(downloader)
                     return@launch
@@ -419,7 +479,7 @@ class MainActivity : AppCompatActivity() {
         return true
     }
 
-    /** m3u8 없이 수집된 .ts 그룹 중 최고화질로 추정되는 그룹을 골라 순번대로 다운로드한다. */
+    /** m3u8 없이 수집된 .ts 그룹 중 최고화질로 추정되는(또는 가장 많이 모인) 그룹을 다운로드한다. */
     private suspend fun downloadFromRawSegments(downloader: SegmentDownloader) {
         if (segmentGroups.isEmpty()) {
             binding.statusText.text = "상태: 세그먼트 그룹을 찾지 못함"
@@ -427,8 +487,6 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        // 그룹 키(URL 경로)에 720/1024/1080 같은 해상도 숫자가 포함돼 있으면 그 값을 우선순위로 사용.
-        // 해상도를 알 수 없는 그룹은 세그먼트 개수를 2차 기준으로 사용한다.
         val bestEntry = segmentGroups.entries.maxWithOrNull(
             compareBy(
                 { extractQualityHint(it.key) ?: -1 },
@@ -443,31 +501,23 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val qualityHint = bestEntry.key.let { extractQualityHint(it) }
-        if (qualityHint != null) {
-            appendLog("해상도 추정치 ${qualityHint}p 그룹 선택 (세그먼트 ${bestGroup.size}개)")
-        } else {
-            appendLog("해상도 정보 없음, 세그먼트 개수가 가장 많은 그룹 선택 (${bestGroup.size}개)")
-        }
         if (segmentGroups.size > 1) {
             appendLog("감지된 전체 그룹 수: ${segmentGroups.size}개 (그룹별 세그먼트: ${segmentGroups.values.map { it.size }})")
         }
 
         val orderedUrls = bestGroup.toSortedMap().values.toList()
-        appendLog("재생목록(m3u8) 없이 세그먼트 ${orderedUrls.size}개로 병합 시도")
+        appendLog("세그먼트 ${orderedUrls.size}개로 병합 시도")
         downloadSegmentList(downloader, orderedUrls)
     }
 
     /** URL/그룹 키 안에서 "720", "1024", "1080p" 같은 해상도로 보이는 숫자를 찾는다. */
     private fun extractQualityHint(urlOrKey: String): Int? {
-        // 1) "1080p", "720P" 처럼 p/P가 붙은 명시적 해상도 표기 우선
         Regex("(\\d{3,4})[pP](?:[_/.?]|$)").find(urlOrKey)?.let {
             return it.groupValues[1].toIntOrNull()
         }
-        // 2) 언더스코어로 구분된 순수 3~4자리 숫자 (예: "..._1024_...")도 해상도일 가능성이 있어 후보로 사용
         Regex("[_-](\\d{3,4})[_-]").findAll(urlOrKey)
             .mapNotNull { it.groupValues[1].toIntOrNull() }
-            .filter { it in 240..4320 } // 합리적인 세로 해상도 범위만 인정
+            .filter { it in 240..4320 }
             .maxOrNull()?.let { return it }
         return null
     }
@@ -516,7 +566,6 @@ class MainActivity : AppCompatActivity() {
             binding.statusText.text = "상태: 완료 -> Movies/$displayName"
             appendLog("저장 완료 (갤러리에서 확인 가능): Movies/$displayName")
         } else {
-            // 실패 시 앱 전용 폴더에라도 남겨둔다 (최소한 데이터 유실은 방지)
             val fallbackDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES)
             val fallbackFile = File(fallbackDir, displayName)
             tempFile.copyTo(fallbackFile, overwrite = true)
@@ -550,7 +599,6 @@ class MainActivity : AppCompatActivity() {
                 contentResolver.update(uri, values, null, null)
                 uri
             } else {
-                // Android 9 이하: 권한이 없으면 실패로 처리 (호출부에서 앱 전용 폴더로 대체)
                 val hasPermission = ContextCompat.checkSelfPermission(
                     this@MainActivity, Manifest.permission.WRITE_EXTERNAL_STORAGE
                 ) == PackageManager.PERMISSION_GRANTED
@@ -576,9 +624,6 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * "YYMMDD_기사제목.확장자" 형태의 최종 표시 파일명을 만든다.
-     * 기사 날짜를 못 가져온 경우 오늘 날짜를 대신 사용하고,
-     * 제목을 못 가져온 경우 시간 기반 이름으로 대체한다.
-     * 동일 이름이 이미 Movies 폴더에 있으면 MediaStore가 자동으로 구분해 저장한다.
      */
     private fun buildDisplayName(extension: String): String {
         val datePrefix = currentArticleDatePrefix.ifBlank {
@@ -594,37 +639,27 @@ class MainActivity : AppCompatActivity() {
 
     private fun sanitizeFileName(rawTitle: String): String {
         var cleaned = rawTitle.trim()
-
-        // 네이버 뉴스 제목에 흔히 붙는 매체/사이트 접미사 제거 (예: "... - 네이버 뉴스")
         cleaned = cleaned.replace(Regex("\\s*[-|:]\\s*네이버\\s*(뉴스|TV)?\\s*$"), "")
-
-        // 파일명으로 쓸 수 없는 문자 치환
         cleaned = cleaned.replace(Regex("[\\\\/:*?\"<>|\\n\\r\\t]"), " ")
         cleaned = cleaned.replace(Regex("\\s+"), " ").trim()
-
-        // 너무 길면 자르기 (파일시스템 경로 길이 제한 대비)
         if (cleaned.length > 80) {
             cleaned = cleaned.substring(0, 80).trim()
         }
-
         return cleaned.ifBlank { "video_${timestamp()}" }
     }
 
     companion object {
-        // 페이지 로드 완료 후 주입되는 스크립트.
-        // 1) 화질(설정) 메뉴가 있으면 찾아서 열고, 가장 높은 해상도 옵션을 자동으로 클릭 시도한다.
-        // 2) <video> 요소를 찾아 음소거 + 4배속 자동 재생시키고, 끝에 도달하면 Android로 신호를 보낸다.
-        // 사이트 구조를 정확히 알 수 없어 (1)은 휴리스틱이며, 실패해도 기본 화질로 정상 진행된다.
-        private const val AUTO_PLAY_SCRIPT = """
+        // 페이지 로드 완료 후 주입되는 초기화 스크립트.
+        // <video> 요소를 찾아 대기하다가, 사용자가 직접 재생 버튼을 누르면(=play 이벤트) 그 즉시
+        // 일시정지시키고 화질 옵션을 수집해 Android로 전달한다. 실제 재생은 Android에서
+        // 화질을 선택한 뒤 RESUME_PLAYBACK_SCRIPT를 통해 다시 시작된다.
+        private const val SETUP_SCRIPT = """
             (function() {
-                // onPageFinished가 여러 번 호출되어 이 스크립트가 페이지에 중복 주입되는 경우를 방지.
-                // 가드가 없으면 MutationObserver가 여러 개 겹쳐 실행되며 무거운 DOM 스캔이 반복되어
-                // WebView가 멈추는 현상이 발생한다.
                 if (window.__naverDlAutoInit) return;
                 window.__naverDlAutoInit = true;
 
                 var triggered = false;
-                var qualitySelectionStarted = false;
+                var popupShown = false;
                 var observer = null;
 
                 function notifyEnded() {
@@ -632,14 +667,8 @@ class MainActivity : AppCompatActivity() {
                     triggered = true;
                     if (window.AndroidBridge) { AndroidBridge.onVideoEnded(); }
                 }
-                function startPlayback(video) {
-                    if (video.__autoDlSetup) return;
-                    video.__autoDlSetup = true;
-                    if (window.AndroidBridge) { AndroidBridge.onVideoFound(); }
-                    video.muted = true;
-                    try { video.playbackRate = 4.0; } catch (e) {}
-                    var playPromise = video.play();
-                    if (playPromise && playPromise.catch) { playPromise.catch(function(e) {}); }
+
+                function attachEndListeners(video) {
                     video.addEventListener('ended', notifyEnded);
                     video.addEventListener('timeupdate', function() {
                         if (video.duration && !isNaN(video.duration) &&
@@ -648,22 +677,7 @@ class MainActivity : AppCompatActivity() {
                         }
                     });
                 }
-                function findHighestQualityOption() {
-                    var nodes = document.querySelectorAll('li, button, a, span, div');
-                    var best = null;
-                    var bestVal = -1;
-                    for (var i = 0; i < nodes.length; i++) {
-                        var el = nodes[i];
-                        if (!el || el.offsetParent === null) continue; // 화면에 보이지 않는 요소 제외
-                        var text = (el.textContent || '').trim();
-                        var m = text.match(/^(\d{3,4})\s*[pP]$/);
-                        if (m) {
-                            var val = parseInt(m[1], 10);
-                            if (val > bestVal) { bestVal = val; best = el; }
-                        }
-                    }
-                    return best;
-                }
+
                 function tryClickSettingsButton() {
                     var selectors = [
                         '[class*="quality"]', '[class*="setting"]', '[class*="config"]',
@@ -675,36 +689,84 @@ class MainActivity : AppCompatActivity() {
                     }
                     return false;
                 }
-                function trySelectHighestQuality(callback) {
-                    // 화질 선택 시도는 페이지당 단 한 번만 수행한다 (반복 DOM 스캔으로 인한 성능 저하 방지).
-                    if (qualitySelectionStarted) { callback(); return; }
-                    qualitySelectionStarted = true;
+
+                function collectQualityOptionTexts() {
+                    var nodes = document.querySelectorAll('li, button, a, span, div');
+                    var set = {};
+                    var list = [];
+                    for (var i = 0; i < nodes.length; i++) {
+                        var el = nodes[i];
+                        if (!el || el.offsetParent === null) continue;
+                        var text = (el.textContent || '').trim();
+                        if (/^\d{3,4}\s*[pP]$/.test(text) && !set[text]) {
+                            set[text] = true;
+                            list.push(text);
+                        }
+                    }
+                    return list;
+                }
+
+                // Android 쪽에서 사용자가 고른 화질 문구로 실제 메뉴 항목을 클릭시키기 위한 전역 함수
+                window.__naverDlSelectQuality = function(text) {
+                    var nodes = document.querySelectorAll('li, button, a, span, div');
+                    for (var i = 0; i < nodes.length; i++) {
+                        var el = nodes[i];
+                        if (!el || el.offsetParent === null) continue;
+                        var t = (el.textContent || '').trim();
+                        if (t === text) { el.click(); return true; }
+                    }
+                    return false;
+                };
+
+                function handlePlay(video) {
+                    if (popupShown) return;
+                    popupShown = true;
+                    video.pause();
 
                     var opened = tryClickSettingsButton();
                     setTimeout(function() {
-                        var best = findHighestQualityOption();
-                        if (best) { best.click(); }
-                        setTimeout(callback, opened ? 400 : 0);
-                    }, opened ? 400 : 0);
+                        var options = collectQualityOptionTexts();
+                        if (window.AndroidBridge) {
+                            AndroidBridge.onQualityOptionsFound(JSON.stringify(options));
+                        }
+                    }, opened ? 400 : 100);
                 }
-                function handleVideoFound(video) {
-                    // 첫 video 요소를 찾는 순간 옵저버를 바로 해제한다 (더 이상 감시할 필요 없음).
-                    if (observer) { observer.disconnect(); }
-                    trySelectHighestQuality(function() { startPlayback(video); });
+
+                function setupVideo(video) {
+                    if (video.__autoDlSetup) return;
+                    video.__autoDlSetup = true;
+                    if (window.AndroidBridge) { AndroidBridge.onVideoFound(); }
+                    attachEndListeners(video);
+                    video.addEventListener('play', function() { handlePlay(video); });
                 }
+
                 function scan() {
                     var video = document.querySelector('video');
-                    if (video) { handleVideoFound(video); return; }
+                    if (video) { setupVideo(video); return; }
                     setTimeout(scan, 500);
                 }
+                scan();
+
                 observer = new MutationObserver(function() {
                     var video = document.querySelector('video');
-                    if (video && !video.__autoDlSetup) { handleVideoFound(video); }
+                    if (video && !video.__autoDlSetup) { setupVideo(video); }
                 });
                 observer.observe(document.documentElement, { childList: true, subtree: true });
                 setTimeout(function() { if (observer) observer.disconnect(); }, 30000);
+            })();
+        """
 
-                scan();
+        // 화질 선택(또는 옵션 없음) 이후 실제 다운로드용 재생을 시작하는 스크립트.
+        // 음소거 + 4배속으로 재생해 세그먼트를 빠르게 모은다.
+        private const val RESUME_PLAYBACK_SCRIPT = """
+            (function() {
+                var v = document.querySelector('video');
+                if (v) {
+                    v.muted = true;
+                    try { v.playbackRate = 4.0; } catch (e) {}
+                    var p = v.play();
+                    if (p && p.catch) { p.catch(function(e) {}); }
+                }
             })();
         """
     }
