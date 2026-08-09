@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.os.Bundle
 import android.os.Environment
 import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -37,11 +38,34 @@ class MainActivity : AppCompatActivity() {
 
     private var currentArticleUrl: String = ""
 
+    // 자동 재생 완료 신호가 중복으로 여러 번 오는 것을 방지
+    private var autoDownloadTriggered = false
+
     private val httpClient by lazy {
         OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .build()
+    }
+
+    /** WebView 안의 JS가 Kotlin으로 "영상 재생 끝났다"는 신호를 보내기 위한 다리 역할 */
+    inner class JsBridge {
+        @JavascriptInterface
+        fun onVideoEnded() {
+            runOnUiThread {
+                if (autoDownloadTriggered) return@runOnUiThread
+                autoDownloadTriggered = true
+                appendLog("자동 배속 재생 완료 감지 -> 자동 다운로드 시작")
+                downloadBest()
+            }
+        }
+
+        @JavascriptInterface
+        fun onVideoFound() {
+            runOnUiThread {
+                appendLog("영상 요소 발견, 배속 자동 재생 시작")
+            }
+        }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -53,6 +77,7 @@ class MainActivity : AppCompatActivity() {
         binding.webView.settings.javaScriptEnabled = true
         binding.webView.settings.domStorageEnabled = true
         binding.webView.settings.mediaPlaybackRequiresUserGesture = false
+        binding.webView.addJavascriptInterface(JsBridge(), "AndroidBridge")
 
         binding.webView.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
@@ -79,6 +104,11 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 return super.shouldInterceptRequest(view, request)
+            }
+
+            override fun onPageFinished(view: WebView, url: String) {
+                super.onPageFinished(view, url)
+                view.evaluateJavascript(AUTO_PLAY_SCRIPT, null)
             }
         }
 
@@ -115,6 +145,7 @@ class MainActivity : AppCompatActivity() {
         currentArticleUrl = url
         detectedPlaylists.clear()
         segmentGroups.clear()
+        autoDownloadTriggered = false
         binding.logText.text = ""
         binding.statusText.text = "상태: 페이지 로딩 중..."
         binding.downloadButton.isEnabled = false
@@ -306,4 +337,48 @@ class MainActivity : AppCompatActivity() {
 
     private fun timestamp(): String =
         SimpleDateFormat("yyyyMMdd_HHmmss", Locale.KOREA).format(Date())
+
+    companion object {
+        // 페이지 로드 완료 후 주입되는 스크립트.
+        // <video> 요소를 찾아 음소거 + 4배속 자동 재생시키고, 끝에 도달하면 Android로 신호를 보낸다.
+        private const val AUTO_PLAY_SCRIPT = """
+            (function() {
+                var triggered = false;
+                function notifyEnded() {
+                    if (triggered) return;
+                    triggered = true;
+                    if (window.AndroidBridge) { AndroidBridge.onVideoEnded(); }
+                }
+                function setup(video) {
+                    if (video.__autoDlSetup) return;
+                    video.__autoDlSetup = true;
+                    if (window.AndroidBridge) { AndroidBridge.onVideoFound(); }
+                    video.muted = true;
+                    try { video.playbackRate = 4.0; } catch (e) {}
+                    var playPromise = video.play();
+                    if (playPromise && playPromise.catch) { playPromise.catch(function(e) {}); }
+                    video.addEventListener('ended', notifyEnded);
+                    video.addEventListener('timeupdate', function() {
+                        if (video.duration && !isNaN(video.duration) &&
+                            video.currentTime >= video.duration - 0.5) {
+                            notifyEnded();
+                        }
+                    });
+                }
+                function scan() {
+                    var video = document.querySelector('video');
+                    if (video) { setup(video); return; }
+                    setTimeout(scan, 500);
+                }
+                scan();
+                // 동적으로 늦게 삽입되는 플레이어 대응 (최대 30초 관찰)
+                var observer = new MutationObserver(function() {
+                    var video = document.querySelector('video');
+                    if (video) { setup(video); }
+                });
+                observer.observe(document.documentElement, { childList: true, subtree: true });
+                setTimeout(function() { observer.disconnect(); }, 30000);
+            })();
+        """
+    }
 }
