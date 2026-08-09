@@ -8,6 +8,9 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: NaverVideoDownloader/NaverVideoDownloader
     steps:
       - name: 저장소 체크아웃
         uses: actions/checkout@v4
@@ -26,6 +29,9 @@ jobs:
         with:
           gradle-version: '8.7'
 
+      - name: 로컬 PC 경로가 담긴 local.properties 제거
+        run: rm -f local.properties
+
       - name: 디버그 APK 빌드
         run: gradle assembleDebug --no-daemon
 
@@ -33,4 +39,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: NaverVideoDownloader-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: NaverVideoDownloader/NaverVideoDownloader/app/build/outputs/apk/debug/app-debug.apk
