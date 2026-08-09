@@ -617,7 +617,16 @@ class MainActivity : AppCompatActivity() {
         // 사이트 구조를 정확히 알 수 없어 (1)은 휴리스틱이며, 실패해도 기본 화질로 정상 진행된다.
         private const val AUTO_PLAY_SCRIPT = """
             (function() {
+                // onPageFinished가 여러 번 호출되어 이 스크립트가 페이지에 중복 주입되는 경우를 방지.
+                // 가드가 없으면 MutationObserver가 여러 개 겹쳐 실행되며 무거운 DOM 스캔이 반복되어
+                // WebView가 멈추는 현상이 발생한다.
+                if (window.__naverDlAutoInit) return;
+                window.__naverDlAutoInit = true;
+
                 var triggered = false;
+                var qualitySelectionStarted = false;
+                var observer = null;
+
                 function notifyEnded() {
                     if (triggered) return;
                     triggered = true;
@@ -667,34 +676,35 @@ class MainActivity : AppCompatActivity() {
                     return false;
                 }
                 function trySelectHighestQuality(callback) {
+                    // 화질 선택 시도는 페이지당 단 한 번만 수행한다 (반복 DOM 스캔으로 인한 성능 저하 방지).
+                    if (qualitySelectionStarted) { callback(); return; }
+                    qualitySelectionStarted = true;
+
                     var opened = tryClickSettingsButton();
                     setTimeout(function() {
                         var best = findHighestQualityOption();
-                        if (best) {
-                            if (window.AndroidBridge) { AndroidBridge.onVideoFound(); }
-                            best.click();
-                        }
+                        if (best) { best.click(); }
                         setTimeout(callback, opened ? 400 : 0);
                     }, opened ? 400 : 0);
                 }
+                function handleVideoFound(video) {
+                    // 첫 video 요소를 찾는 순간 옵저버를 바로 해제한다 (더 이상 감시할 필요 없음).
+                    if (observer) { observer.disconnect(); }
+                    trySelectHighestQuality(function() { startPlayback(video); });
+                }
                 function scan() {
                     var video = document.querySelector('video');
-                    if (video) {
-                        trySelectHighestQuality(function() { startPlayback(video); });
-                        return;
-                    }
+                    if (video) { handleVideoFound(video); return; }
                     setTimeout(scan, 500);
                 }
-                scan();
-                // 동적으로 늦게 삽입되는 플레이어 대응 (최대 30초 관찰)
-                var observer = new MutationObserver(function() {
+                observer = new MutationObserver(function() {
                     var video = document.querySelector('video');
-                    if (video && !video.__autoDlSetup) {
-                        trySelectHighestQuality(function() { startPlayback(video); });
-                    }
+                    if (video && !video.__autoDlSetup) { handleVideoFound(video); }
                 });
                 observer.observe(document.documentElement, { childList: true, subtree: true });
-                setTimeout(function() { observer.disconnect(); }, 30000);
+                setTimeout(function() { if (observer) observer.disconnect(); }, 30000);
+
+                scan();
             })();
         """
     }
