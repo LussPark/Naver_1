@@ -18,6 +18,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
+import org.json.JSONTokener
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -38,6 +39,9 @@ class MainActivity : AppCompatActivity() {
 
     private var currentArticleUrl: String = ""
 
+    // 페이지에서 추출한 기사 제목 (파일명으로 사용)
+    private var currentArticleTitle: String = ""
+
     // 자동 재생 완료 신호가 중복으로 여러 번 오는 것을 방지
     private var autoDownloadTriggered = false
 
@@ -48,7 +52,7 @@ class MainActivity : AppCompatActivity() {
             .build()
     }
 
-    /** WebView 안의 JS가 Kotlin으로 "영상 재생 끝났다"는 신호를 보내기 위한 다리 역할 */
+    /** WebView 안의 JS가 Kotlin으로 신호를 보내기 위한 다리 역할 */
     inner class JsBridge {
         @JavascriptInterface
         fun onVideoEnded() {
@@ -108,6 +112,7 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView, url: String) {
                 super.onPageFinished(view, url)
+                extractArticleTitle(view)
                 view.evaluateJavascript(AUTO_PLAY_SCRIPT, null)
             }
         }
@@ -130,6 +135,28 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** og:title(대표 메타 태그)을 우선 사용하고, 없으면 document.title로 대체해 기사 제목을 가져온다. */
+    private fun extractArticleTitle(view: WebView) {
+        val script = """
+            (function() {
+                var og = document.querySelector('meta[property="og:title"]');
+                if (og && og.content) { return og.content; }
+                return document.title;
+            })();
+        """
+        view.evaluateJavascript(script) { rawResult ->
+            val decoded = try {
+                JSONTokener(rawResult ?: "").nextValue() as? String
+            } catch (e: Exception) {
+                null
+            }
+            if (!decoded.isNullOrBlank()) {
+                currentArticleTitle = decoded
+                appendLog("기사 제목 인식: $decoded")
+            }
+        }
+    }
+
     private fun copyLogToClipboard() {
         val logContent = binding.logText.text.toString()
         if (logContent.isBlank()) {
@@ -143,6 +170,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun startLoad(url: String) {
         currentArticleUrl = url
+        currentArticleTitle = ""
         detectedPlaylists.clear()
         segmentGroups.clear()
         autoDownloadTriggered = false
@@ -241,8 +269,7 @@ class MainActivity : AppCompatActivity() {
     private suspend fun downloadSingleMp4(downloader: SegmentDownloader, mp4Url: String) {
         appendLog("MP4 직접 다운로드: $mp4Url")
         binding.statusText.text = "상태: MP4 다운로드 중..."
-        val fileName = "video_${timestamp()}.mp4"
-        val outputFile = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), fileName)
+        val outputFile = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), buildOutputFileName("mp4"))
 
         downloader.downloadAndMerge(listOf(mp4Url), outputFile) { _, _ ->
             runOnUiThread { binding.statusText.text = "상태: MP4 다운로드 중" }
@@ -315,8 +342,7 @@ class MainActivity : AppCompatActivity() {
         binding.progressBar.max = segments.size
         binding.progressBar.progress = 0
 
-        val fileName = "video_${timestamp()}.ts"
-        val outputFile = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), fileName)
+        val outputFile = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), buildOutputFileName("ts"))
 
         downloader.downloadAndMerge(segments, outputFile) { done, total ->
             runOnUiThread {
@@ -337,6 +363,45 @@ class MainActivity : AppCompatActivity() {
 
     private fun timestamp(): String =
         SimpleDateFormat("yyyyMMdd_HHmmss", Locale.KOREA).format(Date())
+
+    /**
+     * 기사 제목을 파일명으로 사용한다. 제목을 못 가져온 경우 시간 기반 이름으로 대체하고,
+     * 같은 이름 파일이 이미 있으면 뒤에 번호를 붙인다.
+     */
+    private fun buildOutputFileName(extension: String): String {
+        val base = if (currentArticleTitle.isNotBlank()) {
+            sanitizeFileName(currentArticleTitle)
+        } else {
+            "video_${timestamp()}"
+        }
+
+        val dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES)
+        var candidate = "$base.$extension"
+        var counter = 1
+        while (File(dir, candidate).exists()) {
+            candidate = "${base}_${counter}.$extension"
+            counter++
+        }
+        return candidate
+    }
+
+    private fun sanitizeFileName(rawTitle: String): String {
+        var cleaned = rawTitle.trim()
+
+        // 네이버 뉴스 제목에 흔히 붙는 매체/사이트 접미사 제거 (예: "... - 네이버 뉴스")
+        cleaned = cleaned.replace(Regex("\\s*[-|:]\\s*네이버\\s*(뉴스|TV)?\\s*$"), "")
+
+        // 파일명으로 쓸 수 없는 문자 치환
+        cleaned = cleaned.replace(Regex("[\\\\/:*?\"<>|\\n\\r\\t]"), " ")
+        cleaned = cleaned.replace(Regex("\\s+"), " ").trim()
+
+        // 너무 길면 자르기 (파일시스템 경로 길이 제한 대비)
+        if (cleaned.length > 80) {
+            cleaned = cleaned.substring(0, 80).trim()
+        }
+
+        return cleaned.ifBlank { "video_${timestamp()}" }
+    }
 
     companion object {
         // 페이지 로드 완료 후 주입되는 스크립트.
