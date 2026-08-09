@@ -60,6 +60,10 @@ class MainActivity : AppCompatActivity() {
     private var currentSessionId = 0
     private var lastMaxSeqInSession = -1
 
+    // 마지막으로 세그먼트가 감지된 시각 (ms). 아직 재생 중인데 수동으로 성급하게
+    // 다운로드 버튼을 눌러 영상이 잘리는 것을 막기 위한 안전장치로 사용한다.
+    private var lastSegmentReceivedAt = 0L
+
     private var currentArticleUrl: String = ""
 
     // 페이지에서 추출한 기사 제목 (파일명으로 사용)
@@ -94,16 +98,17 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun onVideoEnded() {
             runOnUiThread {
-                // 재생 종료 시 자동으로 다운로드하지 않는다. 화질을 바꿀 시간을 충분히 주기 위함.
-                // 사용자가 원하는 화질로 재생을 끝낸 뒤, 직접 "다운로드" 버튼을 누르면 된다.
-                appendLog("재생 종료 감지. 원하는 화질로 재생하셨다면 아래 \"다운로드\" 버튼을 눌러주세요.")
+                // 화질 전환은 세그먼트 순번 리셋으로 세션 단위로 추적되므로,
+                // 재생이 완전히 끝나는 시점(=현재 선택된 화질의 마지막 세그먼트까지 도착한 시점)에
+                // 자동으로 다운로드해도 안전하다.
+                triggerAutoDownloadOnce("재생 완료 감지")
             }
         }
 
         @JavascriptInterface
         fun onVideoFound() {
             runOnUiThread {
-                appendLog("영상 요소 발견. 재생 후 화질(톱니바퀴) 버튼으로 원하는 화질을 고르고, 다 되면 직접 \"다운로드\" 버튼을 눌러주세요.")
+                appendLog("영상 요소 발견. 재생 후 화질(톱니바퀴) 버튼으로 원하는 화질을 고르세요. 끝까지 재생되면 자동으로 다운로드됩니다.")
             }
         }
     }
@@ -168,7 +173,17 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.downloadButton.setOnClickListener {
-            downloadBest()
+            val elapsedSinceLastSegment = System.currentTimeMillis() - lastSegmentReceivedAt
+            if (segmentGroups.isNotEmpty() && lastSegmentReceivedAt > 0 && elapsedSinceLastSegment < 1500) {
+                Toast.makeText(
+                    this,
+                    "아직 재생 중인 것 같습니다. 영상이 끝날 때까지 기다린 뒤 다시 눌러주세요.",
+                    Toast.LENGTH_LONG
+                ).show()
+                appendLog("다운로드 보류: 최근 ${elapsedSinceLastSegment}ms 전에도 세그먼트가 들어와 아직 재생 중으로 판단")
+            } else {
+                downloadBest()
+            }
         }
 
         binding.copyLogButton.setOnClickListener {
@@ -283,6 +298,7 @@ class MainActivity : AppCompatActivity() {
         segmentSeq = 0
         currentSessionId = 0
         lastMaxSeqInSession = -1
+        lastSegmentReceivedAt = 0L
         autoDownloadTriggered = false
         binding.logText.text = ""
         binding.statusText.text = "상태: 페이지 로딩 중..."
@@ -324,6 +340,7 @@ class MainActivity : AppCompatActivity() {
             appendLog("순번 리셋 감지 -> 화질이 바뀐 것으로 보고 새 세션(#$currentSessionId) 시작")
         }
         lastMaxSeqInSession = maxOf(lastMaxSeqInSession, seq)
+        lastSegmentReceivedAt = System.currentTimeMillis()
 
         val seqDigitsRange = seqMatch.range.first.let { start ->
             val digits = seqMatch.groupValues[1]
