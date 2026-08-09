@@ -650,9 +650,8 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         // 페이지 로드 완료 후 주입되는 초기화 스크립트.
-        // <video> 요소를 찾아 대기하다가, 사용자가 직접 재생 버튼을 누르면(=play 이벤트) 그 즉시
-        // 일시정지시키고 화질 옵션을 수집해 Android로 전달한다. 실제 재생은 Android에서
-        // 화질을 선택한 뒤 RESUME_PLAYBACK_SCRIPT를 통해 다시 시작된다.
+        // <video> 요소 개별에 리스너를 붙이는 대신, document 전체에서 캡처링 단계로 play/ended 이벤트를
+        // 감지한다. 이렇게 하면 플레이어가 video 요소를 나중에 새로 만들거나 교체해도 놓치지 않는다.
         private const val SETUP_SCRIPT = """
             (function() {
                 if (window.__naverDlAutoInit) return;
@@ -660,22 +659,12 @@ class MainActivity : AppCompatActivity() {
 
                 var triggered = false;
                 var popupShown = false;
-                var observer = null;
+                var videoSeen = false;
 
                 function notifyEnded() {
                     if (triggered) return;
                     triggered = true;
                     if (window.AndroidBridge) { AndroidBridge.onVideoEnded(); }
-                }
-
-                function attachEndListeners(video) {
-                    video.addEventListener('ended', notifyEnded);
-                    video.addEventListener('timeupdate', function() {
-                        if (video.duration && !isNaN(video.duration) &&
-                            video.currentTime >= video.duration - 0.5) {
-                            notifyEnded();
-                        }
-                    });
                 }
 
                 function tryClickSettingsButton() {
@@ -721,7 +710,7 @@ class MainActivity : AppCompatActivity() {
                 function handlePlay(video) {
                     if (popupShown) return;
                     popupShown = true;
-                    video.pause();
+                    try { video.pause(); } catch (e) {}
 
                     var opened = tryClickSettingsButton();
                     setTimeout(function() {
@@ -732,27 +721,45 @@ class MainActivity : AppCompatActivity() {
                     }, opened ? 400 : 100);
                 }
 
-                function setupVideo(video) {
-                    if (video.__autoDlSetup) return;
-                    video.__autoDlSetup = true;
-                    if (window.AndroidBridge) { AndroidBridge.onVideoFound(); }
-                    attachEndListeners(video);
-                    video.addEventListener('play', function() { handlePlay(video); });
-                }
+                // document 레벨 캡처링으로 등록: 어떤 video 요소에서 play가 발생하든,
+                // 그 요소가 페이지 로드 이후 새로 생성/교체되었든 상관없이 감지한다.
+                document.addEventListener('play', function(e) {
+                    var video = e.target;
+                    if (!video || video.tagName !== 'VIDEO') return;
+                    if (!videoSeen) {
+                        videoSeen = true;
+                        if (window.AndroidBridge) { AndroidBridge.onVideoFound(); }
+                    }
+                    handlePlay(video);
+                }, true);
 
-                function scan() {
-                    var video = document.querySelector('video');
-                    if (video) { setupVideo(video); return; }
-                    setTimeout(scan, 500);
-                }
-                scan();
+                document.addEventListener('ended', function(e) {
+                    var video = e.target;
+                    if (!video || video.tagName !== 'VIDEO') return;
+                    notifyEnded();
+                }, true);
 
-                observer = new MutationObserver(function() {
+                document.addEventListener('timeupdate', function(e) {
+                    var video = e.target;
+                    if (!video || video.tagName !== 'VIDEO') return;
+                    if (video.duration && !isNaN(video.duration) &&
+                        video.currentTime >= video.duration - 0.5) {
+                        notifyEnded();
+                    }
+                }, true);
+
+                // 참고용: video 요소가 페이지에 존재하는지 미리 확인해서 로그로 알려준다
+                // (play 이벤트 감지와는 별개로, 요소 존재 여부 자체를 진단하기 위함).
+                function scanForDiagnostics() {
                     var video = document.querySelector('video');
-                    if (video && !video.__autoDlSetup) { setupVideo(video); }
-                });
-                observer.observe(document.documentElement, { childList: true, subtree: true });
-                setTimeout(function() { if (observer) observer.disconnect(); }, 30000);
+                    if (video && !videoSeen) {
+                        videoSeen = true;
+                        if (window.AndroidBridge) { AndroidBridge.onVideoFound(); }
+                        return;
+                    }
+                    if (!video) { setTimeout(scanForDiagnostics, 500); }
+                }
+                scanForDiagnostics();
             })();
         """
 
