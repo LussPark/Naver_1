@@ -88,14 +88,16 @@ class MainActivity : AppCompatActivity() {
         @JavascriptInterface
         fun onVideoEnded() {
             runOnUiThread {
-                triggerAutoDownloadOnce("재생 완료 감지")
+                // 재생 종료 시 자동으로 다운로드하지 않는다. 화질을 바꿀 시간을 충분히 주기 위함.
+                // 사용자가 원하는 화질로 재생을 끝낸 뒤, 직접 "다운로드" 버튼을 누르면 된다.
+                appendLog("재생 종료 감지. 원하는 화질로 재생하셨다면 아래 \"다운로드\" 버튼을 눌러주세요.")
             }
         }
 
         @JavascriptInterface
         fun onVideoFound() {
             runOnUiThread {
-                appendLog("영상 요소 발견. 재생 버튼을 눌러 원하는 화질로 재생하세요 (사이트 자체 화질 메뉴 사용).")
+                appendLog("영상 요소 발견. 재생 후 화질(톱니바퀴) 버튼으로 원하는 화질을 고르고, 다 되면 직접 \"다운로드\" 버튼을 눌러주세요.")
             }
         }
     }
@@ -316,7 +318,7 @@ class MainActivity : AppCompatActivity() {
 
         if (isNew) {
             appendLog("세그먼트 #$seq 감지 (그룹 누적 ${map.size}개)")
-            binding.statusText.text = "상태: 세그먼트 수집 중 (재생 종료 시 자동 다운로드)"
+            binding.statusText.text = "상태: 세그먼트 수집 중 (원하는 화질로 재생 후 다운로드 버튼을 누르세요)"
             binding.downloadButton.isEnabled = true
         }
     }
