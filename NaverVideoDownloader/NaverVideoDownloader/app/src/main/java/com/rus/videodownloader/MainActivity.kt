@@ -1,6 +1,8 @@
 package com.rus.videodownloader
 
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.os.Bundle
 import android.os.Environment
 import android.webkit.CookieManager
@@ -83,6 +85,21 @@ class MainActivity : AppCompatActivity() {
         binding.downloadButton.setOnClickListener {
             downloadBest()
         }
+
+        binding.copyLogButton.setOnClickListener {
+            copyLogToClipboard()
+        }
+    }
+
+    private fun copyLogToClipboard() {
+        val logContent = binding.logText.text.toString()
+        if (logContent.isBlank()) {
+            Toast.makeText(this, "복사할 로그가 없습니다", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("영상 다운로더 로그", logContent))
+        Toast.makeText(this, "로그를 클립보드에 복사했습니다", Toast.LENGTH_SHORT).show()
     }
 
     private fun startLoad(url: String) {
