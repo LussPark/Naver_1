@@ -11,8 +11,8 @@ android {
         applicationId = "com.rus.videodownloader"
         minSdk = 24
         targetSdk = 34
-        versionCode = 5
-        versionName = "2.0"
+        versionCode = 6
+        versionName = "2.1"
     }
 
     buildTypes {
