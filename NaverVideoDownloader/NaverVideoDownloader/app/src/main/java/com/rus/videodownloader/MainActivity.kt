@@ -26,7 +26,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private val scope = CoroutineScope(Dispatchers.Main)
 
-    // 페이지 로드 중 감청된 m3u8 URL 목록 (중복 제거, 발견 순서 유지)
+    // 페이지 로드 중 감청된 URL 목록 (중복 제거, 발견 순서 유지)
     private val detectedPlaylists = LinkedHashSet<String>()
 
     private var currentArticleUrl: String = ""
@@ -54,9 +54,19 @@ class MainActivity : AppCompatActivity() {
                 request: WebResourceRequest
             ): WebResourceResponse? {
                 val url = request.url.toString()
-                if (url.contains(".m3u8", ignoreCase = true)) {
+                val lower = url.lowercase()
+
+                // 실제 재생 가능한 스트림 후보 (m3u8 = HLS, mp4 = 직접 다운로드 가능한 단일 파일)
+                if (lower.contains(".m3u8") || lower.contains(".mp4")) {
                     runOnUiThread { onPlaylistDetected(url) }
                 }
+                // 위 조건에 안 걸리더라도, 네이버 영상 서버로 보이는 요청은 참고용으로 로그에 남긴다.
+                else if (lower.contains("pstatic.net") &&
+                    (lower.contains("vod") || lower.contains("video") || lower.contains("media"))
+                ) {
+                    runOnUiThread { appendLog("참고 요청: $url") }
+                }
+
                 return super.shouldInterceptRequest(view, request)
             }
         }
@@ -111,8 +121,32 @@ class MainActivity : AppCompatActivity() {
 
         scope.launch {
             try {
-                // 감지된 재생목록 중 가장 나중에 발견된 것부터 확인 (보통 실제 재생에 쓰인 것이 마지막)
+                // 감지된 항목 중 가장 나중에 발견된 것부터 확인 (보통 실제 재생에 쓰인 것이 마지막)
                 val candidates = detectedPlaylists.toList().reversed()
+
+                // 1) MP4 직접 링크가 있으면 그것부터 우선 시도 (세그먼트 병합 불필요, 가장 단순)
+                val mp4Url = candidates.firstOrNull { it.lowercase().contains(".mp4") }
+                if (mp4Url != null) {
+                    appendLog("MP4 직접 다운로드: $mp4Url")
+                    binding.statusText.text = "상태: MP4 다운로드 중..."
+                    val fileName = "video_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.KOREA).format(Date())}.mp4"
+                    val outputDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES)
+                    val outputFile = File(outputDir, fileName)
+
+                    downloader.downloadAndMerge(listOf(mp4Url), outputFile) { done, total ->
+                        runOnUiThread {
+                            binding.statusText.text = "상태: MP4 다운로드 중"
+                        }
+                    }
+
+                    binding.statusText.text = "상태: 완료 -> ${outputFile.absolutePath}"
+                    appendLog("저장 완료: ${outputFile.absolutePath}")
+                    Toast.makeText(this@MainActivity, "다운로드 완료", Toast.LENGTH_LONG).show()
+                    binding.downloadButton.isEnabled = true
+                    return@launch
+                }
+
+                // 2) MP4가 없으면 m3u8(HLS) 처리
                 var mediaPlaylistUrl: String? = null
                 var mediaPlaylistContent: String? = null
 
