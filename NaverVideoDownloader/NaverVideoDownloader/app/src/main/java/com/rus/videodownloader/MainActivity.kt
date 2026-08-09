@@ -54,6 +54,12 @@ class MainActivity : AppCompatActivity() {
     private val groupLastSeenOrder = mutableMapOf<String, Int>()
     private var segmentSeq = 0
 
+    // 화질을 바꿔도 URL 폴더 경로가 동일한 사이트를 위한 보조 장치.
+    // 세그먼트 순번이 갑자기 뒤로 튀면(예: 30 -> 0) 재생이 처음부터 다시 시작된 것으로 보고
+    // 같은 폴더라도 새로운 세션(=새로운 화질 시도)으로 취급한다.
+    private var currentSessionId = 0
+    private var lastMaxSeqInSession = -1
+
     private var currentArticleUrl: String = ""
 
     // 페이지에서 추출한 기사 제목 (파일명으로 사용)
@@ -275,6 +281,8 @@ class MainActivity : AppCompatActivity() {
         segmentGroups.clear()
         groupLastSeenOrder.clear()
         segmentSeq = 0
+        currentSessionId = 0
+        lastMaxSeqInSession = -1
         autoDownloadTriggered = false
         binding.logText.text = ""
         binding.statusText.text = "상태: 페이지 로딩 중..."
@@ -292,21 +300,38 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * m3u8 없이 개별 .ts 세그먼트만 보이는 경우, 같은 폴더에 속한 세그먼트끼리 그룹으로 묶는다.
-     * 화질을 바꾸면 폴더 경로가 달라지므로 자연스럽게 새 그룹이 생긴다.
+     * m3u8 없이 개별 .ts 세그먼트만 보이는 경우, 세그먼트끼리 그룹으로 묶는다.
+     * 1차 기준: "세그먼트 번호만 {seq}로 치환한 전체 URL(쿼리 포함)" — 화질이 폴더가 아니라
+     *          쿼리 파라미터(비트레이트/화질 토큰 등)로만 구분되는 사이트도 커버한다.
+     * 2차 보강: 그래도 URL이 완전히 동일하게 유지되는 사이트를 대비해, 세그먼트 순번이
+     *          갑자기 뒤로 튀면(예: 30 -> 0, 재생이 처음부터 다시 시작됨) 같은 URL 패턴이라도
+     *          새로운 세션(그룹)으로 취급한다.
      */
     private fun onSegmentDetected(url: String) {
-        val pathOnly = url.substringBefore("?")
-        val groupKey = pathOnly.substringBeforeLast("/")
-
-        val seqMatch = Regex("-(\\d+)\\.ts$").find(pathOnly)
-            ?: Regex("(\\d+)\\.ts$").find(pathOnly)
+        val seqMatch = Regex("-(\\d+)\\.ts(?:\\?|$)").find(url)
+            ?: Regex("(\\d+)\\.ts(?:\\?|$)").find(url)
         val seq = seqMatch?.groupValues?.get(1)?.toIntOrNull()
 
-        if (seq == null) {
+        if (seqMatch == null || seq == null) {
             appendLog("세그먼트 감지(순번 인식 실패): $url")
             return
         }
+
+        // 순번이 뒤로 크게 튀면(예: 30 -> 0) 화질 전환 등으로 재생이 새로 시작된 것으로 간주
+        if (lastMaxSeqInSession >= 0 && seq < lastMaxSeqInSession - 2) {
+            currentSessionId++
+            lastMaxSeqInSession = -1
+            appendLog("순번 리셋 감지 -> 화질이 바뀐 것으로 보고 새 세션(#$currentSessionId) 시작")
+        }
+        lastMaxSeqInSession = maxOf(lastMaxSeqInSession, seq)
+
+        val seqDigitsRange = seqMatch.range.first.let { start ->
+            val digits = seqMatch.groupValues[1]
+            val digitStart = url.indexOf(digits, start)
+            digitStart until (digitStart + digits.length)
+        }
+        val urlPattern = url.replaceRange(seqDigitsRange, "{seq}")
+        val groupKey = "$urlPattern#session$currentSessionId"
 
         val map = segmentGroups.getOrPut(groupKey) { mutableMapOf() }
         val isNew = !map.containsKey(seq)
@@ -317,7 +342,7 @@ class MainActivity : AppCompatActivity() {
         groupLastSeenOrder[groupKey] = segmentSeq++
 
         if (isNew) {
-            appendLog("세그먼트 #$seq 감지 (그룹 누적 ${map.size}개)")
+            appendLog("세그먼트 #$seq 감지 (그룹#$currentSessionId 누적 ${map.size}개, 전체 그룹 ${segmentGroups.size}개)")
             binding.statusText.text = "상태: 세그먼트 수집 중 (원하는 화질로 재생 후 다운로드 버튼을 누르세요)"
             binding.downloadButton.isEnabled = true
         }
