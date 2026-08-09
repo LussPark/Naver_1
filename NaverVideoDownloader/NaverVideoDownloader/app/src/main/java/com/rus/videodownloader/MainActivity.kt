@@ -1,10 +1,16 @@
 package com.rus.videodownloader
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.MediaStore
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceRequest
@@ -12,7 +18,9 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import com.rus.videodownloader.databinding.ActivityMainBinding
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -55,6 +63,14 @@ class MainActivity : AppCompatActivity() {
             .build()
     }
 
+    // Android 9 이하 기기에서 공개 저장소에 쓰기 위한 런타임 권한 요청
+    private val storagePermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (!granted) {
+                appendLog("저장소 권한이 거부되어, 다운로드는 앱 전용 폴더에만 저장됩니다.")
+            }
+        }
+
     /** WebView 안의 JS가 Kotlin으로 신호를 보내기 위한 다리 역할 */
     inner class JsBridge {
         @JavascriptInterface
@@ -79,6 +95,8 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         binding.versionText.text = "v${BuildConfig.VERSION_NAME}"
+
+        requestLegacyStoragePermissionIfNeeded()
 
         binding.webView.settings.javaScriptEnabled = true
         binding.webView.settings.domStorageEnabled = true
@@ -135,6 +153,17 @@ class MainActivity : AppCompatActivity() {
 
         binding.copyLogButton.setOnClickListener {
             copyLogToClipboard()
+        }
+    }
+
+    /** Android 9(API 28) 이하에서만 필요한 레거시 저장소 쓰기 권한을 요청한다. */
+    private fun requestLegacyStoragePermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) return // API 29+는 MediaStore로 권한 없이 저장 가능
+        val granted = ContextCompat.checkSelfPermission(
+            this, Manifest.permission.WRITE_EXTERNAL_STORAGE
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
         }
     }
 
@@ -341,13 +370,14 @@ class MainActivity : AppCompatActivity() {
     private suspend fun downloadSingleMp4(downloader: SegmentDownloader, mp4Url: String) {
         appendLog("MP4 직접 다운로드: $mp4Url")
         binding.statusText.text = "상태: MP4 다운로드 중..."
-        val outputFile = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), buildOutputFileName("mp4"))
+        val displayName = buildDisplayName("mp4")
+        val tempFile = File(cacheDir, "staging_${System.currentTimeMillis()}.mp4")
 
-        downloader.downloadAndMerge(listOf(mp4Url), outputFile) { _, _ ->
+        downloader.downloadAndMerge(listOf(mp4Url), tempFile) { _, _ ->
             runOnUiThread { binding.statusText.text = "상태: MP4 다운로드 중" }
         }
 
-        finishDownload(outputFile)
+        finishDownload(tempFile, displayName, "video/mp4")
     }
 
     /** m3u8 마스터/미디어 재생목록을 파싱해 최고화질로 다운로드. 성공 시 true, 대상이 없으면 false. */
@@ -414,35 +444,103 @@ class MainActivity : AppCompatActivity() {
         binding.progressBar.max = segments.size
         binding.progressBar.progress = 0
 
-        val outputFile = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), buildOutputFileName("ts"))
+        val displayName = buildDisplayName("ts")
+        val tempFile = File(cacheDir, "staging_${System.currentTimeMillis()}.ts")
 
-        downloader.downloadAndMerge(segments, outputFile) { done, total ->
+        downloader.downloadAndMerge(segments, tempFile) { done, total ->
             runOnUiThread {
                 binding.progressBar.progress = done
                 binding.statusText.text = "상태: 다운로드 중 ($done/$total)"
             }
         }
 
-        finishDownload(outputFile)
+        finishDownload(tempFile, displayName, "video/mp2t")
     }
 
-    private fun finishDownload(outputFile: File) {
-        binding.statusText.text = "상태: 완료 -> ${outputFile.absolutePath}"
-        appendLog("저장 완료: ${outputFile.absolutePath}")
+    /**
+     * 임시로 받은 파일을 공개 Movies 폴더(MediaStore)로 옮긴다.
+     * Android 10 이상은 권한 없이 MediaStore로 바로 등록되고, 갤러리/파일관리자에 즉시 노출된다.
+     * Android 9 이하는 실제 공개 Movies 디렉터리에 직접 파일을 쓰고 MediaStore에 등록한다.
+     * 만약 저장소 접근이 실패하면(권한 거부 등) 앱 전용 폴더에 보관하는 것으로 대체한다.
+     */
+    private suspend fun finishDownload(tempFile: File, displayName: String, mimeType: String) {
+        val publicUri = try {
+            saveToPublicMovies(tempFile, displayName, mimeType)
+        } catch (e: Exception) {
+            appendLog("공개 Movies 폴더 저장 실패: ${e.message}")
+            null
+        }
+
+        if (publicUri != null) {
+            tempFile.delete()
+            binding.statusText.text = "상태: 완료 -> Movies/$displayName"
+            appendLog("저장 완료 (갤러리에서 확인 가능): Movies/$displayName")
+        } else {
+            // 실패 시 앱 전용 폴더에라도 남겨둔다 (최소한 데이터 유실은 방지)
+            val fallbackDir = getExternalFilesDir(Environment.DIRECTORY_MOVIES)
+            val fallbackFile = File(fallbackDir, displayName)
+            tempFile.copyTo(fallbackFile, overwrite = true)
+            tempFile.delete()
+            binding.statusText.text = "상태: 완료(앱 전용 폴더) -> ${fallbackFile.absolutePath}"
+            appendLog("저장 완료(앱 전용 폴더): ${fallbackFile.absolutePath}")
+        }
+
         Toast.makeText(this@MainActivity, "다운로드 완료", Toast.LENGTH_LONG).show()
         binding.downloadButton.isEnabled = true
+    }
+
+    private suspend fun saveToPublicMovies(sourceFile: File, displayName: String, mimeType: String): Uri? {
+        return kotlinx.coroutines.withContext(Dispatchers.IO) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
+                    put(MediaStore.Video.Media.MIME_TYPE, mimeType)
+                    put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES)
+                    put(MediaStore.Video.Media.IS_PENDING, 1)
+                }
+                val collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                val uri = contentResolver.insert(collection, values) ?: return@withContext null
+
+                contentResolver.openOutputStream(uri)?.use { out ->
+                    sourceFile.inputStream().use { input -> input.copyTo(out) }
+                } ?: return@withContext null
+
+                values.clear()
+                values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                contentResolver.update(uri, values, null, null)
+                uri
+            } else {
+                // Android 9 이하: 권한이 없으면 실패로 처리 (호출부에서 앱 전용 폴더로 대체)
+                val hasPermission = ContextCompat.checkSelfPermission(
+                    this@MainActivity, Manifest.permission.WRITE_EXTERNAL_STORAGE
+                ) == PackageManager.PERMISSION_GRANTED
+                if (!hasPermission) return@withContext null
+
+                val moviesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES)
+                if (!moviesDir.exists()) moviesDir.mkdirs()
+                val destFile = File(moviesDir, displayName)
+                sourceFile.copyTo(destFile, overwrite = true)
+
+                val values = ContentValues().apply {
+                    put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
+                    put(MediaStore.Video.Media.MIME_TYPE, mimeType)
+                    put(MediaStore.Video.Media.DATA, destFile.absolutePath)
+                }
+                contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+            }
+        }
     }
 
     private fun timestamp(): String =
         SimpleDateFormat("yyyyMMdd_HHmmss", Locale.KOREA).format(Date())
 
     /**
-     * "YYMMDD_기사제목.확장자" 형태의 파일명을 만든다.
+     * "YYMMDD_기사제목.확장자" 형태의 최종 표시 파일명을 만든다.
      * 기사 날짜를 못 가져온 경우 오늘 날짜를 대신 사용하고,
      * 제목을 못 가져온 경우 시간 기반 이름으로 대체한다.
-     * 같은 이름 파일이 이미 있으면 뒤에 번호를 붙인다.
+     * 동일 이름이 이미 Movies 폴더에 있으면 MediaStore가 자동으로 구분해 저장한다.
      */
-    private fun buildOutputFileName(extension: String): String {
+    private fun buildDisplayName(extension: String): String {
         val datePrefix = currentArticleDatePrefix.ifBlank {
             SimpleDateFormat("yyMMdd", Locale.KOREA).format(Date())
         }
@@ -451,16 +549,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             "video_${timestamp()}"
         }
-        val base = "${datePrefix}_$titlePart"
-
-        val dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES)
-        var candidate = "$base.$extension"
-        var counter = 1
-        while (File(dir, candidate).exists()) {
-            candidate = "${base}_${counter}.$extension"
-            counter++
-        }
-        return candidate
+        return "${datePrefix}_$titlePart.$extension"
     }
 
     private fun sanitizeFileName(rawTitle: String): String {
