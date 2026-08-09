@@ -419,17 +419,57 @@ class MainActivity : AppCompatActivity() {
         return true
     }
 
-    /** m3u8 없이 수집된 .ts 그룹 중 세그먼트 수가 가장 많은 그룹을 골라 순번대로 다운로드한다. */
+    /** m3u8 없이 수집된 .ts 그룹 중 최고화질로 추정되는 그룹을 골라 순번대로 다운로드한다. */
     private suspend fun downloadFromRawSegments(downloader: SegmentDownloader) {
-        val bestGroup = segmentGroups.maxByOrNull { it.value.size }?.value
+        if (segmentGroups.isEmpty()) {
+            binding.statusText.text = "상태: 세그먼트 그룹을 찾지 못함"
+            binding.downloadButton.isEnabled = true
+            return
+        }
+
+        // 그룹 키(URL 경로)에 720/1024/1080 같은 해상도 숫자가 포함돼 있으면 그 값을 우선순위로 사용.
+        // 해상도를 알 수 없는 그룹은 세그먼트 개수를 2차 기준으로 사용한다.
+        val bestEntry = segmentGroups.entries.maxWithOrNull(
+            compareBy(
+                { extractQualityHint(it.key) ?: -1 },
+                { it.value.size }
+            )
+        )
+
+        val bestGroup = bestEntry?.value
         if (bestGroup == null) {
             binding.statusText.text = "상태: 세그먼트 그룹을 찾지 못함"
             binding.downloadButton.isEnabled = true
             return
         }
+
+        val qualityHint = bestEntry.key.let { extractQualityHint(it) }
+        if (qualityHint != null) {
+            appendLog("해상도 추정치 ${qualityHint}p 그룹 선택 (세그먼트 ${bestGroup.size}개)")
+        } else {
+            appendLog("해상도 정보 없음, 세그먼트 개수가 가장 많은 그룹 선택 (${bestGroup.size}개)")
+        }
+        if (segmentGroups.size > 1) {
+            appendLog("감지된 전체 그룹 수: ${segmentGroups.size}개 (그룹별 세그먼트: ${segmentGroups.values.map { it.size }})")
+        }
+
         val orderedUrls = bestGroup.toSortedMap().values.toList()
         appendLog("재생목록(m3u8) 없이 세그먼트 ${orderedUrls.size}개로 병합 시도")
         downloadSegmentList(downloader, orderedUrls)
+    }
+
+    /** URL/그룹 키 안에서 "720", "1024", "1080p" 같은 해상도로 보이는 숫자를 찾는다. */
+    private fun extractQualityHint(urlOrKey: String): Int? {
+        // 1) "1080p", "720P" 처럼 p/P가 붙은 명시적 해상도 표기 우선
+        Regex("(\\d{3,4})[pP](?:[_/.?]|$)").find(urlOrKey)?.let {
+            return it.groupValues[1].toIntOrNull()
+        }
+        // 2) 언더스코어로 구분된 순수 3~4자리 숫자 (예: "..._1024_...")도 해상도일 가능성이 있어 후보로 사용
+        Regex("[_-](\\d{3,4})[_-]").findAll(urlOrKey)
+            .mapNotNull { it.groupValues[1].toIntOrNull() }
+            .filter { it in 240..4320 } // 합리적인 세로 해상도 범위만 인정
+            .maxOrNull()?.let { return it }
+        return null
     }
 
     private suspend fun downloadSegmentList(downloader: SegmentDownloader, segments: List<String>) {
@@ -572,7 +612,9 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         // 페이지 로드 완료 후 주입되는 스크립트.
-        // <video> 요소를 찾아 음소거 + 4배속 자동 재생시키고, 끝에 도달하면 Android로 신호를 보낸다.
+        // 1) 화질(설정) 메뉴가 있으면 찾아서 열고, 가장 높은 해상도 옵션을 자동으로 클릭 시도한다.
+        // 2) <video> 요소를 찾아 음소거 + 4배속 자동 재생시키고, 끝에 도달하면 Android로 신호를 보낸다.
+        // 사이트 구조를 정확히 알 수 없어 (1)은 휴리스틱이며, 실패해도 기본 화질로 정상 진행된다.
         private const val AUTO_PLAY_SCRIPT = """
             (function() {
                 var triggered = false;
@@ -581,7 +623,7 @@ class MainActivity : AppCompatActivity() {
                     triggered = true;
                     if (window.AndroidBridge) { AndroidBridge.onVideoEnded(); }
                 }
-                function setup(video) {
+                function startPlayback(video) {
                     if (video.__autoDlSetup) return;
                     video.__autoDlSetup = true;
                     if (window.AndroidBridge) { AndroidBridge.onVideoFound(); }
@@ -597,16 +639,59 @@ class MainActivity : AppCompatActivity() {
                         }
                     });
                 }
+                function findHighestQualityOption() {
+                    var nodes = document.querySelectorAll('li, button, a, span, div');
+                    var best = null;
+                    var bestVal = -1;
+                    for (var i = 0; i < nodes.length; i++) {
+                        var el = nodes[i];
+                        if (!el || el.offsetParent === null) continue; // 화면에 보이지 않는 요소 제외
+                        var text = (el.textContent || '').trim();
+                        var m = text.match(/^(\d{3,4})\s*[pP]$/);
+                        if (m) {
+                            var val = parseInt(m[1], 10);
+                            if (val > bestVal) { bestVal = val; best = el; }
+                        }
+                    }
+                    return best;
+                }
+                function tryClickSettingsButton() {
+                    var selectors = [
+                        '[class*="quality"]', '[class*="setting"]', '[class*="config"]',
+                        '[aria-label*="화질"]', '[aria-label*="설정"]', '[title*="화질"]', '[title*="설정"]'
+                    ];
+                    for (var i = 0; i < selectors.length; i++) {
+                        var el = document.querySelector(selectors[i]);
+                        if (el && el.offsetParent !== null) { el.click(); return true; }
+                    }
+                    return false;
+                }
+                function trySelectHighestQuality(callback) {
+                    var opened = tryClickSettingsButton();
+                    setTimeout(function() {
+                        var best = findHighestQualityOption();
+                        if (best) {
+                            if (window.AndroidBridge) { AndroidBridge.onVideoFound(); }
+                            best.click();
+                        }
+                        setTimeout(callback, opened ? 400 : 0);
+                    }, opened ? 400 : 0);
+                }
                 function scan() {
                     var video = document.querySelector('video');
-                    if (video) { setup(video); return; }
+                    if (video) {
+                        trySelectHighestQuality(function() { startPlayback(video); });
+                        return;
+                    }
                     setTimeout(scan, 500);
                 }
                 scan();
                 // 동적으로 늦게 삽입되는 플레이어 대응 (최대 30초 관찰)
                 var observer = new MutationObserver(function() {
                     var video = document.querySelector('video');
-                    if (video) { setup(video); }
+                    if (video && !video.__autoDlSetup) {
+                        trySelectHighestQuality(function() { startPlayback(video); });
+                    }
                 });
                 observer.observe(document.documentElement, { childList: true, subtree: true });
                 setTimeout(function() { observer.disconnect(); }, 30000);
